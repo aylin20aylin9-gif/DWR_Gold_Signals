@@ -68,17 +68,25 @@ public class MonitoringService extends Service {
 
     public static volatile boolean isServiceRunning = false;
 
-    // ضع مفتاحك من Twelve Data هنا (لا ترفعه على git بمشروع عام)
-    private final String apiKey = "42859d9e50214ae1ab61d571498d44fe";
+    // Gold API: لا يحتاج API Key للسعر اللحظي.
+    // المصدر: https://gold-api.com/docs
+    private static final String GOLD_PRICE_URL = "https://api.gold-api.com/price/XAU/USD";
+    private static final long CANDLE_SECONDS = 300L; // شمعة 5 دقائق
+    private static final int MAX_LOCAL_CANDLES = 120;
+    private static final String PREFS_NAME = "dwr_market_data";
+    private static final String PREF_CANDLES = "local_5m_candles";
 
-    static final long PRICE_POLL_INTERVAL_MS = 10000;   // كل 10 ثواني -> 6 طلبات/دقيقة
-    static final long CANDLE_POLL_INTERVAL_MS = 60000;  // كل 60 ثانية -> 1 طلب/دقيقة
+    static final long PRICE_POLL_INTERVAL_MS = 10000;   // كل 10 ثواني
+    static final long CANDLE_POLL_INTERVAL_MS = 60000;  // تحليل كل 60 ثانية
     static final long RETRY_INTERVAL_MS = 20000;
 
     private Handler handler;
     private ExecutorService executor;
     private boolean isRunning = false;
     private boolean hasLoadedOnce = false;
+    private volatile double latestPrice = 0.0;
+    private final Object candlesLock = new Object();
+    private final ArrayList<Candle> localCandles = new ArrayList<>();
 
     // نتتبع آخر نوع إشارة "أُشعِر" عنها المستخدم حتى لا نكرر نفس الإشعار الصوتي
     // في كل دورة طالما الإشارة نفسها لسه قائمة
@@ -94,6 +102,7 @@ public class MonitoringService extends Service {
         executor = Executors.newSingleThreadExecutor();
         apiDateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
         createNotificationChannels();
+        loadLocalCandles();
     }
 
     @Override
@@ -209,7 +218,7 @@ public class MonitoringService extends Service {
         LocalBroadcastManager.getInstance(this).sendBroadcast(data);
     }
 
-    // ---------- حلقة السعر السريعة (تيكر) ----------
+    // ---------- حلقة السعر السريعة (Gold API) ----------
     private final Runnable priceRunnable = new Runnable() {
         @Override
         public void run() {
@@ -217,20 +226,26 @@ public class MonitoringService extends Service {
 
             executor.execute(() -> {
                 try {
-                    if (apiKey == null || apiKey.equals("YOUR_API_KEY")) return;
-
-                    String json = fetchData("https://api.twelvedata.com/price?symbol=XAU/USD&apikey=" + apiKey);
+                    String json = fetchData(GOLD_PRICE_URL);
                     JSONObject obj = new JSONObject(json);
 
-                    if (obj.has("status") && obj.getString("status").equals("error")) {
+                    if (obj.has("error")) {
+                        String msg = obj.optString("error", "تعذر جلب السعر");
+                        broadcastError("Gold API: " + msg);
                         handler.postDelayed(this, RETRY_INTERVAL_MS);
                         return;
                     }
 
-                    double price = Double.parseDouble(obj.getString("price"));
-                    hasLoadedOnce = true;
-                    String priceText = "السعر الحالي: " + df.format(price);
+                    double price = obj.optDouble("price", Double.NaN);
+                    if (Double.isNaN(price) || price <= 0) {
+                        throw new IllegalStateException("لم يصل سعر XAU/USD من Gold API");
+                    }
 
+                    latestPrice = price;
+                    updateLocalCandle(price, System.currentTimeMillis() / 1000L);
+                    hasLoadedOnce = true;
+
+                    String priceText = "السعر الحالي: " + df.format(price);
                     updateMonitorNotification(priceText);
 
                     Intent data = new Intent(ACTION_UPDATE);
@@ -239,6 +254,7 @@ public class MonitoringService extends Service {
                     broadcastUpdate(data);
 
                 } catch (Exception e) {
+                    broadcastError("تعذر جلب سعر الذهب، ستتم إعادة المحاولة تلقائياً");
                     handler.postDelayed(this, RETRY_INTERVAL_MS);
                     return;
                 }
@@ -247,7 +263,7 @@ public class MonitoringService extends Service {
         }
     };
 
-    // ---------- حلقة الشموع + الإشارة (أبطأ) ----------
+    // ---------- حلقة الشموع + الإشارة (محلياً، بدون طلب API إضافي) ----------
     private final Runnable candleRunnable = new Runnable() {
         @Override
         public void run() {
@@ -255,52 +271,37 @@ public class MonitoringService extends Service {
 
             executor.execute(() -> {
                 try {
-                    if (apiKey == null || apiKey.equals("YOUR_API_KEY")) {
-                        Intent err = new Intent(ACTION_UPDATE);
-                        err.putExtra(EXTRA_ERROR_TEXT, "الرجاء إدخال مفتاح API صحيح");
-                        broadcastUpdate(err);
-                        isRunning = false;
-                        return;
+                    ArrayList<Candle> ascending;
+                    synchronized (candlesLock) {
+                        ascending = new ArrayList<>(localCandles);
                     }
 
-                    String json = fetchData("https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=5min&outputsize=100&timezone=UTC&apikey=" + apiKey);
-                    JSONObject obj = new JSONObject(json);
-
-                    if (obj.has("status") && obj.getString("status").equals("error")) {
-                        String msg = obj.optString("message", "خطأ غير معروف من المصدر");
-                        Intent err = new Intent(ACTION_UPDATE);
-                        err.putExtra(EXTRA_ERROR_TEXT, "خطأ API: " + msg);
-                        broadcastUpdate(err);
-                        handler.postDelayed(this, RETRY_INTERVAL_MS);
-                        return;
+                    long currentBucket = (System.currentTimeMillis() / 1000L) / CANDLE_SECONDS * CANDLE_SECONDS;
+                    ArrayList<Candle> completed = new ArrayList<>();
+                    for (Candle c : ascending) {
+                        if (c.time < currentBucket) completed.add(c);
                     }
 
-                    JSONArray values = obj.getJSONArray("values");
-                    ArrayList<Candle> candles = new ArrayList<>();
-
-                    for (int i = 0; i < values.length(); i++) {
-                        JSONObject v = values.getJSONObject(i);
-                        long epochSeconds;
-                        try {
-                            Date d = apiDateFormat.parse(v.getString("datetime"));
-                            epochSeconds = d.getTime() / 1000L;
-                        } catch (Exception parseEx) {
-                            epochSeconds = System.currentTimeMillis() / 1000L;
-                        }
-                        candles.add(new Candle(
-                                epochSeconds,
-                                Double.parseDouble(v.getString("open")),
-                                Double.parseDouble(v.getString("high")),
-                                Double.parseDouble(v.getString("low")),
-                                Double.parseDouble(v.getString("close"))
-                        ));
+                    if (completed.size() > MAX_LOCAL_CANDLES) {
+                        completed = new ArrayList<>(completed.subList(completed.size() - MAX_LOCAL_CANDLES, completed.size()));
                     }
 
-                    ArrayList<Candle> ascending = new ArrayList<>(candles);
-                    Collections.sort(ascending, (a, b) -> Long.compare(a.time, b.time));
                     String chartJson = buildChartJson(ascending);
+                    if (completed.size() < 6) {
+                        String msg = "جاري جمع بيانات الشموع المحلية: " + completed.size() + "/6";
+                        Intent data = new Intent(ACTION_UPDATE);
+                        data.putExtra(EXTRA_PRICE_TEXT, latestPrice > 0 ? "السعر الحالي: " + df.format(latestPrice) : "السعر الحالي: --");
+                        data.putExtra(EXTRA_SIGNAL_TEXT, msg);
+                        data.putExtra(EXTRA_SIGNAL_TYPE, "none");
+                        data.putExtra(EXTRA_CHART_JSON, chartJson);
+                        data.putExtra(EXTRA_HAS_CHART, !ascending.isEmpty());
+                        broadcastUpdate(data);
+                        persistLocalCandles();
+                        handler.postDelayed(this, CANDLE_POLL_INTERVAL_MS);
+                        return;
+                    }
 
-                    ArrayList<Candle> descending = new ArrayList<>(ascending);
+                    ArrayList<Candle> descending = new ArrayList<>(completed);
                     Collections.reverse(descending);
                     ArrayList<Double> opens = new ArrayList<>();
                     ArrayList<Double> highs = new ArrayList<>();
@@ -365,14 +366,11 @@ public class MonitoringService extends Service {
                         }
                     }
 
-                    double currentPrice = closes.get(0);
+                    double currentPrice = latestPrice > 0 ? latestPrice : closes.get(0);
                     hasLoadedOnce = true;
-
                     String priceText = "السعر الحالي: " + df.format(currentPrice);
                     updateMonitorNotification(priceText + " | " + signal);
 
-                    // نطلق إشعار صوتي فقط عند "دخول" إشارة جديدة مختلفة عن آخر إشارة أُشعِر عنها،
-                    // حتى لا يتكرر التنبيه كل دقيقة طالما نفس الإشارة قائمة
                     if (!signalType.equals("none") && !signalType.equals(lastNotifiedSignalType)) {
                         String alertTitle = signalType.equals("buy")
                                 ? "🔴 إشارة شراء جديدة - XAU/USD"
@@ -384,7 +382,6 @@ public class MonitoringService extends Service {
                         fireSignalAlert(alertTitle, alertBody);
                         lastNotifiedSignalType = signalType;
                     } else if (signalType.equals("none")) {
-                        // رجعنا لحالة "لا توجد إشارة" -> نسمح بإشعار جديد لو ظهرت إشارة تانية بعدين
                         lastNotifiedSignalType = "none";
                     }
 
@@ -399,30 +396,75 @@ public class MonitoringService extends Service {
                     data.putExtra(EXTRA_CHART_JSON, chartJson);
                     data.putExtra(EXTRA_HAS_CHART, true);
                     broadcastUpdate(data);
+                    persistLocalCandles();
 
-                } catch (java.net.SocketTimeoutException e) {
-                    Intent err = new Intent(ACTION_UPDATE);
-                    err.putExtra(EXTRA_ERROR_TEXT, "انتهت مهلة الاتصال بالخادم، سيُعاد المحاولة تلقائياً");
-                    broadcastUpdate(err);
-                    handler.postDelayed(this, RETRY_INTERVAL_MS);
-                    return;
-                } catch (java.io.IOException e) {
-                    Intent err = new Intent(ACTION_UPDATE);
-                    err.putExtra(EXTRA_ERROR_TEXT, "تحقق من اتصال الإنترنت في جهازك");
-                    broadcastUpdate(err);
-                    handler.postDelayed(this, RETRY_INTERVAL_MS);
-                    return;
                 } catch (Exception e) {
-                    Intent err = new Intent(ACTION_UPDATE);
-                    err.putExtra(EXTRA_ERROR_TEXT, "خطأ: " + e.getClass().getSimpleName() + " - " + e.getMessage());
-                    broadcastUpdate(err);
-                    handler.postDelayed(this, RETRY_INTERVAL_MS);
-                    return;
+                    broadcastError("خطأ في تحليل الشموع: " + e.getClass().getSimpleName());
                 }
                 handler.postDelayed(this, CANDLE_POLL_INTERVAL_MS);
             });
         }
     };
+
+    private void updateLocalCandle(double price, long epochSeconds) {
+        long bucket = (epochSeconds / CANDLE_SECONDS) * CANDLE_SECONDS;
+        synchronized (candlesLock) {
+            if (!localCandles.isEmpty()) {
+                Candle last = localCandles.get(localCandles.size() - 1);
+                if (last.time == bucket) {
+                    localCandles.set(localCandles.size() - 1,
+                            new Candle(last.time, last.open, Math.max(last.high, price), Math.min(last.low, price), price));
+                } else if (bucket > last.time) {
+                    localCandles.add(new Candle(bucket, price, price, price, price));
+                } else {
+                    return;
+                }
+            } else {
+                localCandles.add(new Candle(bucket, price, price, price, price));
+            }
+            while (localCandles.size() > MAX_LOCAL_CANDLES) localCandles.remove(0);
+        }
+    }
+
+    private void persistLocalCandles() {
+        try {
+            JSONArray arr = new JSONArray();
+            synchronized (candlesLock) {
+                for (Candle c : localCandles) {
+                    JSONObject o = new JSONObject();
+                    o.put("time", c.time);
+                    o.put("open", c.open);
+                    o.put("high", c.high);
+                    o.put("low", c.low);
+                    o.put("close", c.close);
+                    arr.put(o);
+                }
+            }
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(PREF_CANDLES, arr.toString()).apply();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void loadLocalCandles() {
+        try {
+            String saved = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(PREF_CANDLES, "[]");
+            JSONArray arr = new JSONArray(saved);
+            synchronized (candlesLock) {
+                localCandles.clear();
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject o = arr.getJSONObject(i);
+                    localCandles.add(new Candle(o.getLong("time"), o.getDouble("open"), o.getDouble("high"), o.getDouble("low"), o.getDouble("close")));
+                }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void broadcastError(String message) {
+        Intent err = new Intent(ACTION_UPDATE);
+        err.putExtra(EXTRA_ERROR_TEXT, message);
+        broadcastUpdate(err);
+    }
 
     private String buildChartJson(ArrayList<Candle> sortedAscending) throws Exception {
         JSONArray arr = new JSONArray();
